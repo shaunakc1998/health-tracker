@@ -884,25 +884,39 @@ def signup():
         db = get_db()
         cursor = db.cursor()
         
-        # Check if user exists
-        cursor.execute('SELECT id FROM users WHERE username = ? OR (email = ? AND email != "")', 
-                      (username, email))
+        # Check if user exists - use correct placeholder
+        if DATABASE_URL:
+            cursor.execute('SELECT id FROM users WHERE username = %s OR (email = %s AND email != %s)', 
+                          (username, email, ''))
+        else:
+            cursor.execute('SELECT id FROM users WHERE username = ? OR (email = ? AND email != ?)', 
+                          (username, email, ''))
+        
         if cursor.fetchone():
+            db.close()
             return jsonify({"status": "error", "message": "Username or email already exists"}), 400
         
         # Create user
         password_hash = generate_password_hash(password)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        cursor.execute('''
-            INSERT INTO users (username, password_hash, email, name, created_at, target_calories)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (username, password_hash, email or None, name or username, created_at, 2000))
+        if DATABASE_URL:
+            cursor.execute('''
+                INSERT INTO users (username, password_hash, email, name, created_at, target_calories)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            ''', (username, password_hash, email or None, name or username, created_at, 2000))
+            user_id = cursor.fetchone()['id']
+        else:
+            cursor.execute('''
+                INSERT INTO users (username, password_hash, email, name, created_at, target_calories)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (username, password_hash, email or None, name or username, created_at, 2000))
+            user_id = cursor.lastrowid
         
         db.commit()
+        db.close()
         
         # Auto-login after signup
-        user_id = cursor.lastrowid
         session['user_id'] = user_id
         session['username'] = username
         session.permanent = True  # Make session permanent on signup
@@ -912,7 +926,9 @@ def signup():
         
     except Exception as e:
         logging.error(f"Signup error: {e}")
-        return jsonify({"status": "error", "message": "An error occurred during signup"}), 500
+        if db:
+            db.close()
+        return jsonify({"status": "error", "message": f"Signup failed: {str(e)}"}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -928,11 +944,21 @@ def login():
         db = get_db()
         cursor = db.cursor()
         
-        cursor.execute('SELECT id, password_hash FROM users WHERE username = ?', (username,))
-        user = cursor.fetchone()
+        # Use correct placeholder for database type
+        if DATABASE_URL:
+            cursor.execute('SELECT id, password_hash FROM users WHERE username = %s', (username,))
+        else:
+            cursor.execute('SELECT id, password_hash FROM users WHERE username = ?', (username,))
         
-        if not user or not check_password_hash(user['password_hash'], password):
-            logging.warning(f"Failed login attempt for username: {username}")
+        user = cursor.fetchone()
+        db.close()
+        
+        if not user:
+            logging.warning(f"User not found: {username}")
+            return jsonify({"status": "error", "message": "Invalid username or password"}), 401
+            
+        if not check_password_hash(user['password_hash'], password):
+            logging.warning(f"Invalid password for username: {username}")
             return jsonify({"status": "error", "message": "Invalid username or password"}), 401
         
         session['user_id'] = user['id']
@@ -941,13 +967,17 @@ def login():
         # Make session permanent if "remember me" is checked
         if remember:
             session.permanent = True
+        else:
+            session.permanent = False
         
-        logging.info(f"User logged in: {username}")
+        logging.info(f"User logged in: {username} (ID: {user['id']})")
         return jsonify({"status": "success", "message": "Logged in successfully"}), 200
         
     except Exception as e:
         logging.error(f"Login error: {e}")
-        return jsonify({"status": "error", "message": "An error occurred during login"}), 500
+        if db:
+            db.close()
+        return jsonify({"status": "error", "message": f"Login failed: {str(e)}"}), 500
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
@@ -1055,7 +1085,7 @@ def vitals_route():
         return jsonify(vitals)
 
 # --- MEAL ENDPOINTS ---
-@app.route('/api/meal', methods=['POST', 'GET'])
+@app.route('/api/meal', methods=['POST', 'GET', 'DELETE'])
 @login_required
 def meal_route():
     user_id = session['user_id']
@@ -1066,20 +1096,77 @@ def meal_route():
         date_str = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
         cursor = db.cursor()
         
-        cursor.execute('''
-            SELECT * FROM meals 
-            WHERE user_id = ? AND date = ?
-            ORDER BY 
-                CASE meal_type 
-                    WHEN 'breakfast' THEN 1 
-                    WHEN 'lunch' THEN 2 
-                    WHEN 'snacks' THEN 3 
-                    WHEN 'dinner' THEN 4 
-                END
-        ''', (user_id, date_str))
+        # Use proper placeholder for database type
+        if DATABASE_URL:
+            cursor.execute('''
+                SELECT * FROM meals 
+                WHERE user_id = %s AND date = %s
+                ORDER BY 
+                    CASE meal_type 
+                        WHEN 'breakfast' THEN 1 
+                        WHEN 'lunch' THEN 2 
+                        WHEN 'snacks' THEN 3 
+                        WHEN 'dinner' THEN 4 
+                    END
+            ''', (user_id, date_str))
+        else:
+            cursor.execute('''
+                SELECT * FROM meals 
+                WHERE user_id = ? AND date = ?
+                ORDER BY 
+                    CASE meal_type 
+                        WHEN 'breakfast' THEN 1 
+                        WHEN 'lunch' THEN 2 
+                        WHEN 'snacks' THEN 3 
+                        WHEN 'dinner' THEN 4 
+                    END
+            ''', (user_id, date_str))
         
         meals = [dict(row) for row in cursor.fetchall()]
+        db.close()
         return jsonify(meals)
+    
+    elif request.method == 'DELETE':
+        # Delete a meal
+        meal_id = request.args.get('id')
+        
+        if not meal_id:
+            return jsonify({"status": "error", "message": "Meal ID required"}), 400
+        
+        cursor = db.cursor()
+        
+        # Get date before deleting for summary update
+        if DATABASE_URL:
+            cursor.execute('SELECT date FROM meals WHERE id = %s AND user_id = %s', 
+                          (meal_id, user_id))
+        else:
+            cursor.execute('SELECT date FROM meals WHERE id = ? AND user_id = ?', 
+                          (meal_id, user_id))
+        
+        meal = cursor.fetchone()
+        
+        if meal:
+            date_str = meal['date']
+            
+            # Delete the meal
+            if DATABASE_URL:
+                cursor.execute('DELETE FROM meals WHERE id = %s AND user_id = %s', 
+                             (meal_id, user_id))
+            else:
+                cursor.execute('DELETE FROM meals WHERE id = ? AND user_id = ?', 
+                             (meal_id, user_id))
+            
+            db.commit()
+            db.close()
+            
+            # Update daily summary
+            update_daily_summary(user_id, date_str)
+            
+            logging.info(f"Meal {meal_id} deleted for user {user_id}")
+            return jsonify({"status": "success", "message": "Meal deleted"}), 200
+        
+        db.close()
+        return jsonify({"status": "error", "message": "Meal not found"}), 404
     
     else:  # POST - Add new meal
         meal_type = request.form.get('meal_type', 'snacks')
