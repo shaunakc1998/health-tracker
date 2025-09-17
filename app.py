@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import base64
 import requests
 import logging
@@ -11,6 +10,27 @@ from functools import wraps
 import secrets
 import json
 import hashlib
+
+# Database imports - use PostgreSQL on Render, SQLite locally
+DATABASE_URL = os.getenv('DATABASE_URL')
+if DATABASE_URL:
+    # Running on Render with PostgreSQL
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from urllib.parse import urlparse
+    
+    # Parse the DATABASE_URL
+    result = urlparse(DATABASE_URL)
+    db_config = {
+        'database': result.path[1:],
+        'user': result.username,
+        'password': result.password,
+        'host': result.hostname,
+        'port': result.port
+    }
+else:
+    # Running locally with SQLite
+    import sqlite3
 
 # --- 1. ROBUST LOGGING SETUP ---
 # This will log detailed information to both the console and a file named app.log
@@ -54,131 +74,395 @@ if not GEMINI_API_KEY:
 if not FATSECRET_ACCESS_TOKEN:
     logging.warning("FATSECRET_ACCESS_TOKEN environment variable not set. Nutrition lookup will fail.")
 
-# --- DATABASE HELPERS (Unchanged) ---
+# --- DATABASE HELPERS ---
 def get_db():
-    db = sqlite3.connect(DATABASE)
-    db.row_factory = sqlite3.Row
-    return db
+    if DATABASE_URL:
+        # PostgreSQL for production (Render)
+        conn = psycopg2.connect(
+            database=db_config['database'],
+            user=db_config['user'],
+            password=db_config['password'],
+            host=db_config['host'],
+            port=db_config['port'],
+            cursor_factory=RealDictCursor
+        )
+        return conn
+    else:
+        # SQLite for local development
+        db = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+        return db
+
+def execute_db_query(query, params=None, commit=False, fetchone=False):
+    """Execute a database query with proper parameter handling for both PostgreSQL and SQLite"""
+    db = get_db()
+    cursor = db.cursor()
+    
+    # Convert query for PostgreSQL if needed
+    if DATABASE_URL:
+        # Replace ? with %s for PostgreSQL
+        query = query.replace('?', '%s')
+        # Handle INSERT OR REPLACE
+        if 'INSERT OR REPLACE' in query:
+            # Extract table and columns for ON CONFLICT
+            import re
+            match = re.search(r'INSERT OR REPLACE INTO (\w+)\s*\((.*?)\)', query)
+            if match:
+                table = match.group(1)
+                columns = match.group(2)
+                # Assume first column is unique
+                first_col = columns.split(',')[0].strip()
+                query = query.replace('INSERT OR REPLACE', 'INSERT')
+                query = query.rstrip(')') + f') ON CONFLICT ({first_col}) DO UPDATE SET '
+                # Add update clause for all columns
+                col_list = [c.strip() for c in columns.split(',')]
+                updates = [f"{c} = EXCLUDED.{c}" for c in col_list if c != first_col]
+                query += ', '.join(updates)
+    
+    try:
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        if commit:
+            db.commit()
+        
+        if fetchone:
+            result = cursor.fetchone()
+        else:
+            result = cursor.fetchall()
+        
+        # Get lastrowid for inserts
+        if query.strip().upper().startswith('INSERT'):
+            if DATABASE_URL:
+                # For PostgreSQL, we need to add RETURNING id
+                if 'RETURNING id' not in query:
+                    db.close()
+                    # Re-execute with RETURNING
+                    db = get_db()
+                    cursor = db.cursor()
+                    query = query.rstrip(';') + ' RETURNING id'
+                    if params:
+                        cursor.execute(query, params)
+                    else:
+                        cursor.execute(query)
+                    if commit:
+                        db.commit()
+                    result = cursor.fetchone()
+                    lastrowid = result['id'] if result else None
+                else:
+                    lastrowid = result['id'] if result else None
+            else:
+                lastrowid = cursor.lastrowid
+            cursor.close()
+            db.close()
+            return lastrowid
+        
+        cursor.close()
+        db.close()
+        return result
+        
+    except Exception as e:
+        db.close()
+        raise e
+
+def execute_query(query, params=None, commit=False):
+    """Execute a query with proper cursor handling for both databases"""
+    db = get_db()
+    
+    if DATABASE_URL:
+        # PostgreSQL
+        cursor = db.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        if commit:
+            db.commit()
+            
+        if query.strip().upper().startswith('SELECT'):
+            result = cursor.fetchall()
+            cursor.close()
+            db.close()
+            return result
+        elif query.strip().upper().startswith('INSERT'):
+            # Get the last inserted id for PostgreSQL
+            if 'RETURNING id' not in query:
+                query = query.rstrip(';') + ' RETURNING id'
+                cursor.execute(query, params)
+            last_id = cursor.fetchone()['id'] if cursor.rowcount > 0 else None
+            if commit:
+                db.commit()
+            cursor.close()
+            db.close()
+            return last_id
+        else:
+            cursor.close()
+            db.close()
+            return None
+    else:
+        # SQLite
+        cursor = db.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        if commit:
+            db.commit()
+            
+        if query.strip().upper().startswith('SELECT'):
+            result = cursor.fetchall()
+        elif query.strip().upper().startswith('INSERT'):
+            result = cursor.lastrowid
+        else:
+            result = None
+            
+        db.close()
+        return result
 
 def init_db():
     with app.app_context():
         db = get_db()
-        cursor = db.cursor()
         
-        # Users table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                email TEXT UNIQUE,
-                created_at TEXT NOT NULL,
-                name TEXT,
-                age INTEGER,
-                height REAL,
-                target_calories INTEGER DEFAULT 2000
-            )
-        ''')
+        if DATABASE_URL:
+            # PostgreSQL schema
+            cursor = db.cursor()
+            
+            # Users table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    email VARCHAR(255) UNIQUE,
+                    created_at TIMESTAMP NOT NULL,
+                    name VARCHAR(255),
+                    age INTEGER,
+                    height REAL,
+                    target_calories INTEGER DEFAULT 2000
+                )
+            ''')
+        else:
+            # SQLite schema
+            cursor = db.cursor()
+            
+            # Users table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    email TEXT UNIQUE,
+                    created_at TEXT NOT NULL,
+                    name TEXT,
+                    age INTEGER,
+                    height REAL,
+                    target_calories INTEGER DEFAULT 2000
+                )
+            ''')
         
-        # Updated vitals table with user_id
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vitals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                date TEXT NOT NULL,
-                weight REAL,
-                bmi REAL,
-                body_fat_percentage REAL,
-                skeletal_muscle_percentage REAL,
-                fat_free_mass REAL,
-                subcutaneous_fat REAL,
-                visceral_fat REAL,
-                body_water_percentage REAL,
-                muscle_mass REAL,
-                bone_mass REAL,
-                protein_percentage REAL,
-                bmr REAL,
-                metabolic_age INTEGER,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
+        # Vitals table
+        if DATABASE_URL:
+            # PostgreSQL
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS vitals (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    weight REAL,
+                    bmi REAL,
+                    body_fat_percentage REAL,
+                    skeletal_muscle_percentage REAL,
+                    fat_free_mass REAL,
+                    subcutaneous_fat REAL,
+                    visceral_fat REAL,
+                    body_water_percentage REAL,
+                    muscle_mass REAL,
+                    bone_mass REAL,
+                    protein_percentage REAL,
+                    bmr REAL,
+                    metabolic_age INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+        else:
+            # SQLite
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS vitals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    weight REAL,
+                    bmi REAL,
+                    body_fat_percentage REAL,
+                    skeletal_muscle_percentage REAL,
+                    fat_free_mass REAL,
+                    subcutaneous_fat REAL,
+                    visceral_fat REAL,
+                    body_water_percentage REAL,
+                    muscle_mass REAL,
+                    bone_mass REAL,
+                    protein_percentage REAL,
+                    bmr REAL,
+                    metabolic_age INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
         
-        # Updated meals table with meal_type and user_id
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS meals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                date TEXT NOT NULL,
-                meal_type TEXT NOT NULL,
-                food_items TEXT,
-                calories REAL,
-                protein REAL,
-                fat REAL,
-                carbohydrates REAL,
-                image_data TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
+        # Meals table
+        if DATABASE_URL:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS meals (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    meal_type VARCHAR(50) NOT NULL,
+                    food_items TEXT,
+                    calories REAL,
+                    protein REAL,
+                    fat REAL,
+                    carbohydrates REAL,
+                    image_data TEXT,
+                    created_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+        else:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS meals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    meal_type TEXT NOT NULL,
+                    food_items TEXT,
+                    calories REAL,
+                    protein REAL,
+                    fat REAL,
+                    carbohydrates REAL,
+                    image_data TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
         
-        # Exercise/Activity table for calorie burn tracking
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS activities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                date TEXT NOT NULL,
-                activity_name TEXT NOT NULL,
-                duration_minutes INTEGER,
-                calories_burned REAL,
-                notes TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
+        # Activities table
+        if DATABASE_URL:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS activities (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    activity_name VARCHAR(255) NOT NULL,
+                    duration_minutes INTEGER,
+                    calories_burned REAL,
+                    notes TEXT,
+                    created_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+        else:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS activities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    activity_name TEXT NOT NULL,
+                    duration_minutes INTEGER,
+                    calories_burned REAL,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
         
         # Daily summary table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS daily_summary (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                date TEXT NOT NULL,
-                total_calories_consumed REAL DEFAULT 0,
-                total_calories_burned REAL DEFAULT 0,
-                net_calories REAL DEFAULT 0,
-                total_protein REAL DEFAULT 0,
-                total_fat REAL DEFAULT 0,
-                total_carbs REAL DEFAULT 0,
-                water_intake_ml REAL DEFAULT 0,
-                notes TEXT,
-                UNIQUE(user_id, date),
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
+        if DATABASE_URL:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_summary (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    total_calories_consumed REAL DEFAULT 0,
+                    total_calories_burned REAL DEFAULT 0,
+                    net_calories REAL DEFAULT 0,
+                    total_protein REAL DEFAULT 0,
+                    total_fat REAL DEFAULT 0,
+                    total_carbs REAL DEFAULT 0,
+                    water_intake_ml REAL DEFAULT 0,
+                    notes TEXT,
+                    UNIQUE(user_id, date),
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+        else:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_summary (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    total_calories_consumed REAL DEFAULT 0,
+                    total_calories_burned REAL DEFAULT 0,
+                    net_calories REAL DEFAULT 0,
+                    total_protein REAL DEFAULT 0,
+                    total_fat REAL DEFAULT 0,
+                    total_carbs REAL DEFAULT 0,
+                    water_intake_ml REAL DEFAULT 0,
+                    notes TEXT,
+                    UNIQUE(user_id, date),
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
         
-        # Cache table for API responses to reduce API calls
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS api_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cache_key TEXT UNIQUE NOT NULL,
-                response_data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            )
-        ''')
-        
-        # Food nutrition cache for common foods
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS food_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                food_name TEXT UNIQUE NOT NULL,
-                calories REAL,
-                protein REAL,
-                fat REAL,
-                carbohydrates REAL,
-                serving_size TEXT DEFAULT '100g',
-                last_updated TEXT NOT NULL
-            )
-        ''')
+        # Cache tables
+        if DATABASE_URL:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS api_cache (
+                    id SERIAL PRIMARY KEY,
+                    cache_key VARCHAR(255) UNIQUE NOT NULL,
+                    response_data TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS food_cache (
+                    id SERIAL PRIMARY KEY,
+                    food_name VARCHAR(255) UNIQUE NOT NULL,
+                    calories REAL,
+                    protein REAL,
+                    fat REAL,
+                    carbohydrates REAL,
+                    serving_size VARCHAR(50) DEFAULT '100g',
+                    last_updated TIMESTAMP NOT NULL
+                )
+            ''')
+        else:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS api_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cache_key TEXT UNIQUE NOT NULL,
+                    response_data TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS food_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    food_name TEXT UNIQUE NOT NULL,
+                    calories REAL,
+                    protein REAL,
+                    fat REAL,
+                    carbohydrates REAL,
+                    serving_size TEXT DEFAULT '100g',
+                    last_updated TEXT NOT NULL
+                )
+            ''')
         
         db.commit()
 
@@ -198,12 +482,19 @@ def get_cached_response(cache_key, cache_type='api_cache'):
     db = get_db()
     cursor = db.cursor()
     
-    cursor.execute(f'''
-        SELECT response_data FROM {cache_type}
-        WHERE cache_key = ? AND expires_at > ?
-    ''', (cache_key, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    if DATABASE_URL:
+        cursor.execute(f'''
+            SELECT response_data FROM {cache_type}
+            WHERE cache_key = %s AND expires_at > %s
+        ''', (cache_key, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    else:
+        cursor.execute(f'''
+            SELECT response_data FROM {cache_type}
+            WHERE cache_key = ? AND expires_at > ?
+        ''', (cache_key, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     
     result = cursor.fetchone()
+    db.close()
     if result:
         logging.info(f"Cache hit for key: {cache_key[:8]}...")
         return json.loads(result['response_data'])
@@ -216,12 +507,23 @@ def save_to_cache(cache_key, data, hours=24):
     
     expires_at = (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     
-    cursor.execute('''
-        INSERT OR REPLACE INTO api_cache (cache_key, response_data, created_at, expires_at)
-        VALUES (?, ?, ?, ?)
-    ''', (cache_key, json.dumps(data), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
+    if DATABASE_URL:
+        cursor.execute('''
+            INSERT INTO api_cache (cache_key, response_data, created_at, expires_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (cache_key) DO UPDATE SET
+                response_data = EXCLUDED.response_data,
+                created_at = EXCLUDED.created_at,
+                expires_at = EXCLUDED.expires_at
+        ''', (cache_key, json.dumps(data), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
+    else:
+        cursor.execute('''
+            INSERT OR REPLACE INTO api_cache (cache_key, response_data, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+        ''', (cache_key, json.dumps(data), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
     
     db.commit()
+    db.close()
     logging.info(f"Cached response for key: {cache_key[:8]}...")
 
 def analyze_image_with_gemini(image_data_base64):
@@ -272,13 +574,21 @@ def get_cached_food_nutrition(food_name):
     db = get_db()
     cursor = db.cursor()
     
-    cursor.execute('''
-        SELECT calories, protein, fat, carbohydrates 
-        FROM food_cache 
-        WHERE LOWER(food_name) = LOWER(?)
-    ''', (food_name,))
+    if DATABASE_URL:
+        cursor.execute('''
+            SELECT calories, protein, fat, carbohydrates 
+            FROM food_cache 
+            WHERE LOWER(food_name) = LOWER(%s)
+        ''', (food_name,))
+    else:
+        cursor.execute('''
+            SELECT calories, protein, fat, carbohydrates 
+            FROM food_cache 
+            WHERE LOWER(food_name) = LOWER(?)
+        ''', (food_name,))
     
     result = cursor.fetchone()
+    db.close()
     if result:
         logging.info(f"Found cached nutrition for: {food_name}")
         return {
@@ -295,18 +605,37 @@ def save_food_to_cache(food_name, nutrition):
     cursor = db.cursor()
     
     # Save base values (per 100g)
-    cursor.execute('''
-        INSERT OR REPLACE INTO food_cache 
-        (food_name, calories, protein, fat, carbohydrates, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (food_name, 
-          nutrition['calories'] / 1.5,  # Store per 100g
-          nutrition['protein'] / 1.5,
-          nutrition['fat'] / 1.5,
-          nutrition['carbohydrates'] / 1.5,
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    if DATABASE_URL:
+        cursor.execute('''
+            INSERT INTO food_cache 
+            (food_name, calories, protein, fat, carbohydrates, last_updated)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (food_name) DO UPDATE SET
+                calories = EXCLUDED.calories,
+                protein = EXCLUDED.protein,
+                fat = EXCLUDED.fat,
+                carbohydrates = EXCLUDED.carbohydrates,
+                last_updated = EXCLUDED.last_updated
+        ''', (food_name, 
+              nutrition['calories'] / 1.5,  # Store per 100g
+              nutrition['protein'] / 1.5,
+              nutrition['fat'] / 1.5,
+              nutrition['carbohydrates'] / 1.5,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    else:
+        cursor.execute('''
+            INSERT OR REPLACE INTO food_cache 
+            (food_name, calories, protein, fat, carbohydrates, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (food_name, 
+              nutrition['calories'] / 1.5,  # Store per 100g
+              nutrition['protein'] / 1.5,
+              nutrition['fat'] / 1.5,
+              nutrition['carbohydrates'] / 1.5,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     
     db.commit()
+    db.close()
 
 def get_nutrition_from_fatsecret(food_item):
     """

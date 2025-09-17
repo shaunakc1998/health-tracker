@@ -4,6 +4,7 @@ Werkzeug==3.0.1
 
 # Database
 # SQLite3 is included with Python
+psycopg2-binary==2.9.9  # PostgreSQL support for Render
 
 # Security
 python-dotenv==1.0.0
