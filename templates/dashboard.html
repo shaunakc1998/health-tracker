@@ -1051,15 +1051,38 @@
                     totalCalories += meal.calories || 0;
                     const mealEl = document.createElement('div');
                     mealEl.className = 'meal-item';
+                    mealEl.style.cssText = 'display: flex; justify-content: space-between; align-items: center; gap: 10px;';
                     mealEl.innerHTML = `
-                        <span class="meal-item-name">${meal.food_items || 'Meal'}</span>
-                        <span class="meal-item-calories">${Math.round(meal.calories || 0)} kcal</span>
+                        <div style="flex: 1;">
+                            <span class="meal-item-name">${meal.food_items || 'Meal'}</span>
+                            <span class="meal-item-calories" style="margin-left: 10px;">${Math.round(meal.calories || 0)} kcal</span>
+                        </div>
+                        <button onclick="deleteMeal(${meal.id})" style="padding: 2px 8px; background: #fc8181; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">×</button>
                     `;
                     container.appendChild(mealEl);
                 });
                 
                 caloriesEl.textContent = `${Math.round(totalCalories)} kcal`;
             });
+        }
+        
+        // Delete meal function
+        async function deleteMeal(id) {
+            if (!confirm('Delete this meal?')) return;
+            
+            try {
+                const response = await fetch(`/api/meal?id=${id}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    loadDailyData();
+                } else {
+                    alert('Failed to delete meal');
+                }
+            } catch (error) {
+                alert('Error deleting meal: ' + error.message);
+            }
         }
         
         // Display activities
