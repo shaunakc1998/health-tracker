@@ -1,0 +1,21 @@
+# Core Framework
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# Database
+# SQLite3 is included with Python
+
+# Security
+python-dotenv==1.0.0
+
+# HTTP Requests
+requests==2.31.0
+
+# Image Processing (optional, for future enhancements)
+Pillow==10.2.0
+
+# Production Server (optional)
+gunicorn==21.2.0
+
+# Development Dependencies (optional)
+flask-cors==4.0.0
