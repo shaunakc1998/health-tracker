@@ -7,15 +7,10 @@ Werkzeug==3.0.1
 
 # Security
 python-dotenv==1.0.0
+bcrypt==4.0.1
 
 # HTTP Requests
 requests==2.31.0
 
-# Image Processing (optional, for future enhancements)
-Pillow==10.2.0
-
-# Production Server (optional)
+# Production Server
 gunicorn==21.2.0
-
-# Development Dependencies (optional)
-flask-cors==4.0.0
