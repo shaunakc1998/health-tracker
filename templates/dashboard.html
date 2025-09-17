@@ -1202,11 +1202,8 @@
                     document.getElementById('meal-results-content').innerHTML = resultsHTML;
                     document.getElementById('meal-results').classList.remove('hidden');
                     
-                    // Auto-save and close
-                    setTimeout(() => {
-                        closeMealModal();
-                        loadDailyData();
-                    }, 1500);
+                    // Don't auto-close - let user review and confirm
+                    // User can click "Save Meal" button to save
                 } else {
                     const error = await response.json();
                     alert(error.message || 'Failed to analyze meal');
