@@ -1407,6 +1407,13 @@ def calendar_data(year, month):
     return jsonify(calendar_data)
 
 # --- MAIN EXECUTION ---
+# Initialize database on startup (for both local and production)
+with app.app_context():
+    try:
+        init_db()
+        logging.info("Database initialized successfully")
+    except Exception as e:
+        logging.error(f"Error initializing database: {e}")
+
 if __name__ == '__main__':
-    init_db()
     app.run(debug=True, host='0.0.0.0', port=5001)
