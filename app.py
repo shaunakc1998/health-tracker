@@ -29,10 +29,22 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FATSECRET_ACCESS_TOKEN = os.getenv("FATSECRET_ACCESS_TOKEN") # Switched to Access Token for simplicity
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
-app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))  # Use env variable or generate
+
+# IMPORTANT: Use a fixed secret key for session persistence across restarts
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    # Generate a persistent secret key if not in environment
+    SECRET_KEY = 'your-fixed-secret-key-change-this-in-production-' + secrets.token_hex(16)
+    logging.warning("Using generated SECRET_KEY. Set SECRET_KEY environment variable for production!")
+
+app.secret_key = SECRET_KEY
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True if using HTTPS
+app.config['SESSION_COOKIE_NAME'] = 'health_tracker_session'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)  # Session lasts 7 days
+app.config['SESSION_REFRESH_EACH_REQUEST'] = False  # Don't refresh session on every request
+
 DATABASE = 'database.db'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 
